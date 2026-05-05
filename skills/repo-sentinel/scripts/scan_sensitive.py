@@ -23,7 +23,8 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from scripts.utils import (
+import utils
+from utils import (
     get_commit_log,
     get_tag_info,
     iso_now,

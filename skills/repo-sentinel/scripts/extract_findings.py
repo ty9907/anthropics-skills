@@ -16,7 +16,7 @@ import json
 import sys
 from pathlib import Path
 
-from scripts.utils import write_status
+from utils import write_status
 
 
 def extract_findings(report_path: str, batch_size: int = 0, retry_failed: bool = False) -> list[dict]:

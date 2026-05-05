@@ -26,7 +26,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from scripts.utils import iso_now, write_status
+from utils import iso_now, write_status
 
 
 ANALYSIS_COLUMNS = ["is_sensitive", "confirmed_risk_level", "llm_reasoning", "recommendation", "analysis_timestamp"]
