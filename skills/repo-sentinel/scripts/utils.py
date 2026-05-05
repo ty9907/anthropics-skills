@@ -10,11 +10,16 @@
 """
 
 import json
+import os
+import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 
 def iso_now() -> str:
@@ -236,11 +241,162 @@ def get_tag_info(mirror_path: Path) -> list[dict[str, str]]:
     return tags
 
 
+def extract_repo_name(repo_url: str) -> str:
+    """
+    从仓库 URL 中提取仓库名称
+
+    规则：从 URL 路径部分提取，如 https://github.com/org/my-repo → org_my-repo
+
+    参数：
+        repo_url: 仓库 URL
+
+    返回：
+        仓库名称字符串
+    """
+    repo_name = urlparse(repo_url).path.strip("/").replace("/", "_")
+    if repo_name.endswith(".git"):
+        repo_name = repo_name[:-4]
+    return repo_name
+
+
+def clone_repo(repo_url: str, workspace: str, token: str = "",
+               timeout: int = 600, retry_count: int = 2, force: bool = False) -> dict:
+    """
+    使用 git clone 命令克隆单个仓库
+
+    流程：
+    1. 使用 git clone --mirror 创建裸镜像（包含所有分支、标签、提交历史）
+    2. 从远程创建工作副本
+    3. 收集仓库元数据（分支列表、标签列表、提交数）
+
+    参数：
+        repo_url: 仓库 URL
+        workspace: 工作目录
+        token: GitHub Personal Access Token（可选）
+        timeout: 单次克隆超时时间（秒）
+        retry_count: 最大重试次数
+        force: 是否强制覆盖已有目录
+
+    返回：
+        包含克隆结果和元数据的字典
+    """
+    repo_name = extract_repo_name(repo_url)
+    mirror_dir = Path(workspace) / "mirrors" / f"{repo_name}.git"
+    working_dir = Path(workspace) / "repos" / repo_name
+
+    result_info = {
+        "name": repo_name,
+        "url": repo_url,
+        "status": "not_started",
+        "mirror_path": str(mirror_dir),
+        "working_path": str(working_dir),
+        "branches": [],
+        "tags": [],
+        "commit_count": 0,
+        "duration_seconds": 0,
+        "error": None,
+    }
+
+    if not force and mirror_dir.exists() and working_dir.exists():
+        print(f"  [{repo_name}] 检测到已有目录，跳过下载（使用 --force 强制覆盖）")
+        result_info["status"] = "completed"
+        result_info["skipped"] = True
+        try:
+            result_info["branches"] = get_all_branches(mirror_dir)
+            result_info["tags"] = get_all_tags(mirror_dir)
+            result_info["commit_count"] = get_commit_count(mirror_dir)
+        except Exception:
+            pass
+        return result_info
+
+    if force:
+        if mirror_dir.exists():
+            shutil.rmtree(mirror_dir, ignore_errors=True)
+        if working_dir.exists():
+            shutil.rmtree(working_dir, ignore_errors=True)
+
+    askpass_script = None
+    env = os.environ.copy()
+    if token:
+        script_dir = tempfile.mkdtemp(prefix="repo_sentinel_")
+        askpass_script = os.path.join(script_dir, "askpass.sh")
+        with open(askpass_script, "w") as f:
+            f.write(f"#!/bin/sh\necho '{token}'\n")
+        os.chmod(askpass_script, 0o700)
+        env["GIT_ASKPASS"] = askpass_script
+        env["GIT_TERMINAL_PROMPT"] = "0"
+
+    start_time = time.time()
+
+    for attempt in range(1, retry_count + 1):
+        try:
+            result_info["status"] = "in_progress"
+
+            if mirror_dir.exists():
+                shutil.rmtree(mirror_dir, ignore_errors=True)
+            if working_dir.exists():
+                shutil.rmtree(working_dir, ignore_errors=True)
+
+            mirror_dir.parent.mkdir(parents=True, exist_ok=True)
+            working_dir.parent.mkdir(parents=True, exist_ok=True)
+
+            print(f"  [{repo_name}] 正在克隆镜像（第 {attempt}/{retry_count} 次尝试）...")
+            clone_result = run_git(
+                ["clone", "--mirror", "--progress", repo_url, str(mirror_dir)],
+                timeout=timeout,
+                env=env,
+            )
+            if clone_result.returncode != 0:
+                raise RuntimeError(f"镜像克隆失败: {clone_result.stderr.strip()}")
+
+            print(f"  [{repo_name}] 正在创建工作副本...")
+            work_result = run_git(
+                ["clone", repo_url, str(working_dir)],
+                timeout=timeout,
+            )
+            if work_result.returncode != 0:
+                raise RuntimeError(f"工作副本创建失败: {work_result.stderr.strip()}")
+
+            result_info["branches"] = get_all_branches(mirror_dir)
+            result_info["tags"] = get_all_tags(mirror_dir)
+            result_info["commit_count"] = get_commit_count(mirror_dir)
+            result_info["status"] = "completed"
+            result_info["duration_seconds"] = round(time.time() - start_time, 2)
+            print(f"  [{repo_name}] 完成（{result_info['commit_count']} 次提交，"
+                  f"{len(result_info['branches'])} 个分支，{len(result_info['tags'])} 个标签）")
+            break
+
+        except subprocess.TimeoutExpired:
+            result_info["error"] = f"超时（{timeout}秒），第 {attempt}/{retry_count} 次尝试"
+            print(f"  [{repo_name}] 第 {attempt} 次尝试超时")
+        except Exception as e:
+            result_info["error"] = f"{type(e).__name__}: {e}，第 {attempt}/{retry_count} 次尝试"
+            print(f"  [{repo_name}] 第 {attempt} 次尝试出错: {e}")
+            if attempt < retry_count:
+                wait = 2 ** attempt
+                print(f"  [{repo_name}] {wait} 秒后重试...")
+                time.sleep(wait)
+    else:
+        result_info["status"] = "failed"
+        result_info["duration_seconds"] = round(time.time() - start_time, 2)
+
+    if askpass_script:
+        try:
+            script_dir = os.path.dirname(askpass_script)
+            os.remove(askpass_script)
+            os.rmdir(script_dir)
+        except OSError:
+            pass
+
+    return result_info
+
+
 def pipeline_main(args: list[str] | None = None) -> None:
     """
-    单仓库完整流水线入口（下载→扫描→提取→写回分析结果）
+    单仓库完整流水线入口（下载→扫描→提取 Finding）
 
     每个仓库独立执行完整流程，无需等待其他仓库。
+    下载步骤使用 git clone 命令，无需 download_repos.py 脚本。
     节点三的分析由 Agent 直接完成，此入口仅执行节点一、二并提取 Finding。
 
     参数：
@@ -253,14 +409,13 @@ def pipeline_main(args: list[str] | None = None) -> None:
     parser.add_argument("--token", default="", help="GitHub Token")
     parser.add_argument("--rules", required=True, help="扫描规则文件路径或规则目录路径（支持 .xlsx/.xls/.csv/.json 格式）")
     parser.add_argument("--output-dir", required=True, help="输出工作目录")
-    parser.add_argument("--download-timeout", type=int, default=1800, help="下载超时时间（秒）")
+    parser.add_argument("--download-timeout", type=int, default=600, help="下载超时时间（秒）")
     parser.add_argument("--force", action="store_true", help="强制覆盖已有目录")
 
     parsed = parser.parse_args(args)
     workspace = Path(parsed.output_dir)
     workspace.mkdir(parents=True, exist_ok=True)
 
-    from scripts.download_repos import extract_repo_name
     repo_name = extract_repo_name(parsed.repo_url)
 
     print("=" * 60)
@@ -269,14 +424,13 @@ def pipeline_main(args: list[str] | None = None) -> None:
     print("=" * 60)
 
     print("\n[1/3] 正在下载仓库...")
-    from scripts.download_repos import main as download_main
-    download_main([
-        "--repo-url", parsed.repo_url,
-        "--token", parsed.token,
-        "--output-dir", str(workspace),
-        "--timeout", str(parsed.download_timeout),
-        "--force" if parsed.force else "",
-    ])
+    result = clone_repo(
+        parsed.repo_url, str(workspace), parsed.token,
+        parsed.download_timeout, 2, parsed.force,
+    )
+    if result["status"] == "failed":
+        print(f"下载失败: {result.get('error', '未知错误')}")
+        return
 
     print("\n[2/3] 正在扫描敏感信息...")
     from scripts.scan_sensitive import main as scan_main

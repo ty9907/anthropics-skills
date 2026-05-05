@@ -81,26 +81,34 @@ Subagent 3: [下载 repo3] → [扫描 repo3] → repo3_scan.xlsx → [分析 re
 
 #### 2.1 下载仓库
 
+直接使用 `git clone` 命令下载，无需 Python 脚本：
+
 ```bash
-python -m scripts.download_repos \
-  --repo-url "https://github.com/org/repo1" \
-  --token "ghp_xxx" \
-  --output-dir ./workspace \
-  --force
+# 创建 mirrors 和 repos 目录
+mkdir -p ./workspace/mirrors ./workspace/repos
+
+# 镜像完整仓库（包含所有分支、标签和提交历史）
+git clone --mirror https://github.com/org/repo1 ./workspace/mirrors/org_repo1.git
+
+# 创建工作副本
+git clone https://github.com/org/repo1 ./workspace/repos/org_repo1
 ```
 
 **仓库名称提取规则**：从 URL 路径部分提取，如 `https://github.com/org/my-repo` → `org_my-repo`
 
-**参数说明**：
+**私有仓库认证**：使用 `GIT_ASKPASS` 环境变量传递 token：
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| --repo-url | - | 单个仓库 URL |
-| --token | - | GitHub 令牌（公开仓库可省略） |
-| --output-dir | - | 输出工作目录 |
-| --timeout | 1800 | 每个仓库的超时时间（秒） |
-| --retry-count | 2 | 每个仓库的重试次数 |
-| --force | false | 强制覆盖已有目录 |
+```bash
+echo '#!/bin/sh\necho "$GIT_TOKEN"' > git-askpass.sh
+chmod +x git-askpass.sh
+export GIT_ASKPASS=./git-askpass.sh
+export GIT_TOKEN=ghp_xxxxxxxxxxxx
+git clone --mirror https://github.com/org/private-repo ./workspace/mirrors/org_private-repo.git
+```
+
+**重试逻辑**：如果 clone 失败，等待 5 秒后重试（最多 2 次）。
+
+**已有目录处理**：如果 `mirrors/<name>.git` 或 `repos/<name>` 已存在且非空，跳过该步骤。
 
 #### 2.2 扫描仓库（立即生成扫描报告）
 
@@ -255,10 +263,9 @@ python -m scripts.write_analysis \
 
 ```bash
 # 1. 下载仓库
-python -m scripts.download_repos \
-  --repo-url "https://github.com/org/my-repo" \
-  --output-dir ./workspace \
-  --force
+mkdir -p ./workspace/mirrors ./workspace/repos
+git clone --mirror https://github.com/org/my-repo ./workspace/mirrors/org_my-repo.git
+git clone https://github.com/org/my-repo ./workspace/repos/org_my-repo
 
 # 2. 扫描仓库（立即生成扫描报告）
 python -m scripts.scan_sensitive \
@@ -303,7 +310,7 @@ python -m scripts.utils pipeline \
   --force
 ```
 
-此命令自动执行下载→扫描→提取 Finding，节点三的分析由 Agent 直接完成。
+此命令自动执行下载（git clone）→扫描→提取 Finding，节点三的分析由 Agent 直接完成。
 
 ## 输出目录结构
 
@@ -331,11 +338,12 @@ workspace/
 
 ### 重试失败的下载
 
+删除失败的仓库目录后重新执行 git clone：
+
 ```bash
-python -m scripts.download_repos \
-  --repo-url "https://github.com/org/repo" \
-  --output-dir ./workspace \
-  --retry-failed
+rm -rf ./workspace/mirrors/org_repo.git ./workspace/repos/org_repo
+git clone --mirror https://github.com/org/repo ./workspace/mirrors/org_repo.git
+git clone https://github.com/org/repo ./workspace/repos/org_repo
 ```
 
 ### 重试失败的分析
@@ -350,11 +358,12 @@ python -m scripts.extract_findings \
 
 ### 强制重新下载
 
+删除已有目录后重新 clone：
+
 ```bash
-python -m scripts.download_repos \
-  --repo-url "https://github.com/org/repo" \
-  --output-dir ./workspace \
-  --force
+rm -rf ./workspace/mirrors/org_repo.git ./workspace/repos/org_repo
+git clone --mirror https://github.com/org/repo ./workspace/mirrors/org_repo.git
+git clone https://github.com/org/repo ./workspace/repos/org_repo
 ```
 
 ## 常见问题解答
@@ -363,7 +372,7 @@ python -m scripts.download_repos \
 答：前往 GitHub Settings > Developer settings > Personal access tokens > Generate new token。选择 `repo` 权限范围即可访问私有仓库。
 
 **问：下载超时了怎么办？**
-答：该仓库会被标记为失败并记录错误详情。你可以使用 `--retry-failed` 重试，或增大 `--timeout` 值。
+答：删除失败的仓库目录后重新执行 git clone，或使用流水线入口的 `--download-timeout` 参数增大超时值。
 
 **问：可以只扫描单个仓库吗？**
 答：可以，使用 `--repo-name` 参数指定仓库名称：

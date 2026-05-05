@@ -14,8 +14,8 @@ description: 并行下载GitHub仓库、敏感信息扫描和大模型分析确�
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
 | `parallelism` | `2` | 同时运行的最大 subagent 数量。控制下载、扫描阶段的并行度。Agent 将仓库列表按此值分批，每批并行执行，批内完成后启动下一批。设为 `1` 即串行执行。 |
-| `download_timeout` | `1800` | 单个仓库下载超时时间（秒） |
-| `download_retry` | `2` | 下载失败后最大重试次数 |
+| `git_clone_timeout` | `600` | 单个仓库 git clone 超时时间（秒），适用于 git clone 命令的 --timeout 参数 |
+| `git_clone_retry` | `2` | git clone 失败后最大重试次数 |
 | `analysis_batch_size` | `10` | 单次分析 Finding 的批量大小（0=不分批） |
 
 **使用方式**：Agent 在编排任务前读取此配置表，按 `parallelism` 值决定并行 subagent 数量。如需调整，直接修改上表中的默认值即可。
@@ -87,8 +87,19 @@ parallelism=2 时，使用 task() 分批创建 subagent：
 ## 执行步骤
 
 ### 步骤1：下载仓库
-执行命令：
-python -m scripts.download_repos --repo-url "{repo_url}" --output-dir {workspace} --timeout {download_timeout} --retry-count {download_retry} --force
+执行命令（直接使用 git clone，无需 Python 脚本）：
+
+```bash
+# 创建 mirrors 和 repos 目录
+mkdir -p {workspace}/mirrors {workspace}/repos
+
+# 镜像完整仓库（所有分支、标签、提交历史）
+git clone --mirror {repo_url} {workspace}/mirrors/{repo_name}.git
+
+# 创建工作副本
+cd {workspace}/repos
+git clone {repo_url} {workspace}/repos/{repo_name}
+```
 
 ### 步骤2：扫描仓库
 执行命令：
@@ -148,10 +159,13 @@ parallelism=2 时，10个仓库分5批执行：
 ## 快速开始
 
 ```bash
+# 安装扫描和分析脚本的依赖（下载步骤使用原生 git clone，无需 Python 依赖）
 pip install -r scripts/requirements.txt
 ```
 
 ## Subagent 并行编排指令
+
+> **⚠️ 核心原则：每个 subagent 必须原子性地完成一个仓库的全部流程（下载→扫描→提取→分析→写回），禁止将流程拆分到不同 subagent 或按节点阶段批量执行。**
 
 ### 第一步：读取配置
 
@@ -161,20 +175,43 @@ Agent 在编排任务前，必须先读取上方「运行配置」表中的参�
 
 读取用户提供的仓库列表和规则文件，确认文件存在且格式正确。
 
-### 第三步：按 parallelism 分批生成 subagent
+### 第三步：按仓库维度分批创建 subagent
+
+**编排原则**：以仓库为最小调度单位，每个 subagent 绑定一个仓库并完成其全部生命周期。**绝不允许**按节点阶段（如"先下载所有仓库，再扫描所有仓库"）组织执行。
 
 将仓库列表按 `parallelism` 值分批，每批最多 `parallelism` 个 subagent 并行执行。每批全部完成后，再启动下一批。
 
+**正确的编排方式**（按仓库维度）：
+
+```
+parallelism=2，4个仓库：
+
+批次1: Subagent A: repo1 下载→扫描→提取→分析→写回 → repo1_analysis.xlsx  ✅
+       Subagent B: repo2 下载→扫描→提取→分析→写回 → repo2_analysis.xlsx  ✅
+       → 等待批次1全部完成
+
+批次2: Subagent C: repo3 下载→扫描→提取→分析→写回 → repo3_analysis.xlsx  ✅
+       Subagent D: repo4 下载→扫描→提取→分析→写回 → repo4_analysis.xlsx  ✅
+```
+
+**❌ 错误的编排方式**（按节点阶段，必须避免）：
+
+```
+阶段1: 下载所有仓库（repo1, repo2, repo3, repo4）  ← 错误！
+阶段2: 扫描所有仓库                                  ← 错误！
+阶段3: 分析所有仓库                                  ← 错误！
+```
+
 **分批示例**（parallelism=2，10个仓库）：
-- 批次1：repo1, repo2（并行）
-- 批次2：repo3, repo4（并行）
-- 批次3：repo5, repo6（并行）
-- 批次4：repo7, repo8（并行）
-- 批次5：repo9, repo10（并行）
+- 批次1：repo1, repo2（并行，每个完成全流程）
+- 批次2：repo3, repo4（并行，每个完成全流程）
+- 批次3：repo5, repo6（并行，每个完成全流程）
+- 批次4：repo7, repo8（并行，每个完成全流程）
+- 批次5：repo9, repo10（并行，每个完成全流程）
 
 #### 非OpenCode环境（默认）
 
-每个 subagent 对应一个仓库，通过并行运行终端命令实现。Agent 对每个仓库依次执行步骤 3.1~3.5，同批次内的仓库并行启动命令。
+每个仓库由一个独立的执行序列完成全流程。Agent 对每个仓库依次执行下载→扫描→提取→分析→写回，同批次内的仓库并行启动。**一个仓库的全部步骤必须在同一个执行序列中连续完成，不得中断去处理其他仓库。**
 
 #### OpenCode环境
 
@@ -193,7 +230,7 @@ Agent 在编排任务前，必须先读取上方「运行配置」表中的参�
 **OpenCode task() 调用示例**（parallelism=2，批次1）：
 
 ```
-# 同时创建2个 subagent
+# 同时创建2个 subagent，每个负责一个仓库的完整流程
 task(subagent_type="general", description="你是仓库哨兵的 subagent...\n## 目标仓库\n- 仓库 URL: https://github.com/keycloak/keycloak.git\n- 仓库名称: keycloak_keycloak\n- 工作目录: /path/to/workspace\n- 规则文件: /path/to/rules\n\n## 执行步骤\n### 步骤1：下载仓库\n...")
 
 task(subagent_type="general", description="你是仓库哨兵的 subagent...\n## 目标仓库\n- 仓库 URL: https://github.com/jeecgboot/JeecgBoot.git\n- 仓库名称: jeecgboot_JeecgBoot\n- 工作目录: /path/to/workspace\n- 规则文件: /path/to/rules\n\n## 执行步骤\n### 步骤1：下载仓库\n...")
@@ -201,23 +238,30 @@ task(subagent_type="general", description="你是仓库哨兵的 subagent...\n##
 
 > **注意**：`description` 参数的完整模板见「OpenCode 环境适配 → subagent description 模板」章节。Agent 应将模板中的 `{repo_url}`、`{repo_name}`、`{workspace}`、`{rules_path}` 等占位符替换为实际值后传入。
 
-**每个 subagent 执行以下步骤：**
+### 第四步：每个 subagent 的完整执行流程
 
-#### 3.1 下载仓库
+以下步骤是**单个 subagent 处理单个仓库时必须连续完成的全部操作**，不得拆分或与其他仓库的操作交替执行。
+
+#### 4.1 下载仓库
+
+直接使用 `git clone` 命令下载，无需 Python 脚本：
 
 ```bash
-python -m scripts.download_repos \
-  --repo-url "<仓库URL>" \
-  --token "<Token或空>" \
-  --output-dir <工作目录> \
-  --timeout <download_timeout> \
-  --retry-count <download_retry> \
-  --force
+# 创建 mirrors 和 repos 目录
+mkdir -p <工作目录>/mirrors <工作目录>/repos
+
+# 镜像完整仓库（包含所有分支、标签和提交历史）
+git clone --mirror <仓库URL> <工作目录>/mirrors/<仓库名称>.git
+
+# 创建工作副本
+git clone <仓库URL> <工作目录>/repos/<仓库名称>
 ```
+
+**重试逻辑**：如果 clone 失败，subagent 应重复尝试（最多 {git_clone_retry} 次），每次等待 5 秒后重试。
 
 **仓库名称提取规则**：从 URL 路径部分提取，如 `https://github.com/org/my-repo` → `org_my-repo`
 
-#### 3.2 扫描仓库（立即生成扫描报告）
+#### 4.2 扫描仓库（立即生成扫描报告）
 
 ```bash
 python -m scripts.scan_sensitive \
@@ -233,7 +277,7 @@ python -m scripts.scan_sensitive \
 
 扫描完成后立即输出 `workspace/reports/<repo_name>_scan.xlsx`，无需等待其他仓库。
 
-#### 3.3 提取 Finding 数据
+#### 4.3 提取 Finding 数据
 
 ```bash
 python -m scripts.extract_findings \
@@ -243,17 +287,17 @@ python -m scripts.extract_findings \
   --output <工作目录>/reports/<repo_name>_findings.json
 ```
 
-#### 3.4 Sub-agent 分析每条 Finding
+#### 4.4 分析每条 Finding
 
 每个 sub-agent 读取 Finding 数据，**仅基于扫描报告中的匹配代码片段及上下文进行分析**，不访问原始代码文件。
 
-**非OpenCode环境**：Agent 自身逐条读取 Finding JSON 并进行推理分析，将结果汇总后通过步骤 3.5 写回。
+**非OpenCode环境**：Agent 自身逐条读取 Finding JSON 并进行推理分析，将结果汇总后通过步骤 4.5 写回。
 
 **OpenCode环境**：
 
 > **⚠️ 以下内容仅在 OpenCode 环境下适用。非 OpenCode 环境请使用上方默认方式。**
 
-在 OpenCode 环境中，分析阶段由步骤 3 中创建的 subagent 自行完成，无需额外创建分析专用 subagent。subagent 在执行完步骤 3.3（提取 Finding）后，直接读取 findings.json 并逐条分析，然后将结果保存为 analysis_results.json，再执行步骤 3.5（写回）。
+在 OpenCode 环境中，分析阶段由第三步中创建的 subagent **在其完整流程内自行完成**，无需额外创建分析专用 subagent。subagent 在执行完步骤 4.3（提取 Finding）后，直接读取 findings.json 并逐条分析，然后将结果保存为 analysis_results.json，再执行步骤 4.5（写回）。**分析是 subagent 生命周期的一部分，不得交由其他 subagent 或主 Agent 处理。**
 
 如果 Finding 数量较多（超过 `analysis_batch_size`），subagent 可分批分析，每批处理 `analysis_batch_size` 条，所有批次结果合并后统一写回。
 
@@ -299,7 +343,7 @@ python -m scripts.extract_findings \
 }
 ```
 
-#### 3.5 写回分析结果并生成最终分析报告
+#### 4.5 写回分析结果并生成最终分析报告
 
 ```bash
 # 批量写回（推荐：所有 sub-agent 完成后汇总写入）
@@ -319,38 +363,39 @@ python -m scripts.write_analysis \
 ### 运行方式
 
 ```bash
-python -m scripts.download_repos \
-  --repo-url "https://github.com/org/repo" \
-  --token "ghp_xxxx" \
-  --output-dir ./workspace \
-  --timeout 1800 \
-  --force
+# 1. 镜像完整仓库（所有分支、标签、提交历史）
+git clone --mirror https://github.com/org/repo ./workspace/mirrors/org_repo.git
+
+# 2. 创建工作副本
+git clone https://github.com/org/repo ./workspace/repos/org_repo
 ```
 
-### 输入格式
+### 认证方式
 
-**repos.json：**
+**公开仓库**：无需认证，直接 clone。
 
-```json
-[
-  {
-    "url": "https://github.com/org/public-repo",
-    "token": null
-  },
-  {
-    "url": "https://github.com/org/private-repo",
-    "token": "ghp_xxxxxxxxxxxx"
-  }
-]
+**私有仓库**：使用 `GIT_ASKPASS` 环境变量传递 token：
+
+```bash
+# 创建一个 askpass 脚本
+echo '#!/bin/sh
+echo "$GIT_TOKEN"' > git-askpass.sh
+chmod +x git-askpass.sh
+
+# 设置环境变量并执行 clone
+export GIT_ASKPASS=./git-askpass.sh
+export GIT_TOKEN=ghp_xxxxxxxxxxxx
+git clone --mirror https://github.com/org/private-repo ./workspace/mirrors/org_private-repo.git
 ```
 
 ### 行为说明
 
-- **完整克隆**：使用 `git clone --mirror` 捕获所有分支、标签和提交历史，然后创建工作副本
-- **认证机制**：公开仓库无需 token。私有仓库通过 `GIT_ASKPASS` 传递 token，绝不以明文写入磁盘
-- **超时设置**：默认每个仓库30分钟
-- **错误处理**：失败时自动重试（默认2次），采用指数退避
-- **已有目录处理**：检测到已有完整目录时跳过下载（使用 `--force` 强制覆盖）
+- **完整克隆**：使用 `git clone --mirror` 捕获所有分支、标签和提交历史
+- **工作副本**：直接从远程 clone 工作副本（不依赖 mirror，两者各自独立下载可并行执行）
+- **认证机制**：公开仓库无需 token。私有仓库通过 `GIT_ASKPASS` 传递 token
+- **超时设置**：使用 git 的 `--timeout` 参数（单位：秒），默认每个仓库 600 秒
+- **错误处理**：subagent 应实现重试逻辑，失败时等待 5 秒后重试
+- **已有目录处理**：如果 `mirrors/<name>.git` 或 `repos/<name>` 已存在且非空，跳过该步骤
 
 ### 输出目录结构
 
@@ -359,10 +404,9 @@ workspace/
 ├── mirrors/
 │   ├── repo1.git/          # 裸镜像（所有分支/标签/历史）
 │   └── repo2.git/
-├── repos/
-│   ├── repo1/              # 工作副本
-│   └── repo2/
-└── download_status.json    # 下载状态
+└── repos/
+    ├── repo1/              # 工作副本
+    └── repo2/
 ```
 
 ## 节点二：敏感信息扫描
@@ -478,14 +522,14 @@ rules/
 
 > **⚠️ 以下内容仅在 OpenCode 环境下适用。非 OpenCode 环境请忽略，继续使用原有方式。**
 
-在 OpenCode 环境中，节点三的分析由 `task(subagent_type="general")` 创建的 subagent 在其完整流程内自行完成。主 Agent 无需为分析阶段单独创建 subagent，也无需在 subagent 之间传递中间数据。
+在 OpenCode 环境中，节点三的分析由 `task(subagent_type="general")` 创建的 subagent **在其完整流程内自行完成**。主 Agent 无需为分析阶段单独创建 subagent，也无需在 subagent 之间传递中间数据。**分析是 subagent 生命周期的一部分，不得拆分为独立阶段或交由其他 subagent 处理。**
 
 **OpenCode 环境下的分析执行方式**：
 
-1. subagent 执行完步骤 3.3（提取 Finding）后，直接读取 findings.json
+1. subagent 执行完步骤 4.3（提取 Finding）后，直接读取 findings.json
 2. subagent 利用自身推理能力逐条分析每条 Finding
 3. subagent 将所有分析结果汇总为 JSON 数组，保存至 `analysis_results.json`
-4. subagent 执行步骤 3.5（写回分析结果并生成最终报告）
+4. subagent 执行步骤 4.5（写回分析结果并生成最终报告）
 5. subagent 完成后向主 Agent 汇报结果摘要
 
 **与默认方式的差异**：
@@ -546,19 +590,25 @@ rules/
 
 每个节点写入状态文件：
 
-- `workspace/download_status.json` — 节点一
 - `workspace/scan_status.json` — 节点二
 - `workspace/analysis_status.json` — 节点三
 
 有效状态值：`not_started`（未开始）、`in_progress`（进行中）、`completed`（已完成）、`failed`（失败）。
 
+> **注意**：节点一（仓库下载）使用 git clone 直接执行，不产生状态文件。subagent 应通过检查 `repos/<name>/` 目录是否存在来确认下载是否完成。
+
 ## 错误恢复
 
-重试失败的节点：
+重试失败的操作：
 
 ```bash
-# 重试失败的下载
-python -m scripts.download_repos --repo-url "<URL>" --output-dir ./workspace --retry-failed
+# 重试失败的下载：删除失败的 mirrors/<name>.git 和 repos/<name>，重新执行 git clone
+rm -rf ./workspace/mirrors/<repo_name>.git ./workspace/repos/<repo_name>
+git clone --mirror <仓库URL> ./workspace/mirrors/<repo_name>.git
+git clone <仓库URL> ./workspace/repos/<repo_name>
+
+# 重试失败的扫描
+python -m scripts.scan_sensitive --workspace ./workspace --rules ./rules --repo-name <repo_name>
 
 # 重试失败的分析（重新提取未分析的 Finding）
 python -m scripts.extract_findings --report ./workspace/reports/repo1_scan.xlsx --retry-failed --format analysis
